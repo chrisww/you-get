@@ -12,6 +12,7 @@ import logging
 import argparse
 import ssl
 from http import cookiejar
+from http.client import HTTPException
 from importlib import import_module
 from urllib import request, parse, error
 
@@ -137,6 +138,7 @@ cookies = None
 output_filename = None
 auto_rename = False
 insecure = False
+retry_time = 3
 
 fake_headers = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',  # noqa
@@ -396,7 +398,6 @@ def get_location(url, headers=None, get_method='HEAD'):
 
 
 def urlopen_with_retry(*args, **kwargs):
-    retry_time = 3
     for i in range(retry_time):
         try:
             if insecure:
@@ -407,15 +408,12 @@ def urlopen_with_retry(*args, **kwargs):
                 return request.urlopen(*args, context=ctx, **kwargs)
             else:
                 return request.urlopen(*args, **kwargs)
-        except socket.timeout as e:
-            logging.debug('request attempt %s timeout' % str(i + 1))
+        except (socket.timeout, error.HTTPError, error.URLError, HTTPException) as e:
+            logging.debug('request attempt {} failed: {}'.format(i + 1, e))
             if i + 1 == retry_time:
                 raise e
-        # try to tackle youku CDN fails
-        except error.HTTPError as http_error:
-            logging.debug('HTTP Error with code{}'.format(http_error.code))
-            if i + 1 == retry_time:
-                raise http_error
+
+        time.sleep(5)
 
 
 def get_content(url, headers={}, decoded=True):
@@ -437,8 +435,15 @@ def get_content(url, headers={}, decoded=True):
         cookies.add_cookie_header(req)
         req.headers.update(req.unredirected_hdrs)
 
-    response = urlopen_with_retry(req)
-    data = response.read()
+    for i in range(retry_time):
+        response = urlopen_with_retry(req)
+        try:
+            data = response.read()
+            break
+        except socket.timeout as e:
+            logging.debug('get_content attempt {} failed: {}'.format(i + 1, e))
+            if i + 1 == retry_time:
+                raise e
 
     # Handle HTTP compression for gzip and deflate (zlib)
     content_encoding = response.getheader('Content-Encoding')
@@ -1551,6 +1556,11 @@ def script_main(download, download_playlist, **kwargs):
         help='ignore ssl errors'
     )
 
+    download_grp.add_argument(
+        '-r', '--retry', metavar="RETRY_TIME", type=int, default=3,
+        help='Set the limit of retrying download'
+    )
+
     proxy_grp = parser.add_argument_group('Proxy options')
     proxy_grp = proxy_grp.add_mutually_exclusive_group()
     proxy_grp.add_argument(
@@ -1597,6 +1607,8 @@ def script_main(download, download_playlist, **kwargs):
     global output_filename
     global auto_rename
     global insecure
+    global retry_time
+
     output_filename = args.output_filename
     extractor_proxy = args.extractor_proxy
 
@@ -1630,6 +1642,8 @@ def script_main(download, download_playlist, **kwargs):
         # ignore ssl
         insecure = True
 
+    if args.retry:
+        retry_time = args.retry
 
     if args.no_proxy:
         set_http_proxy('')
